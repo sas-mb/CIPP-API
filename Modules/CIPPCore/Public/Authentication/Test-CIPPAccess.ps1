@@ -7,25 +7,21 @@ function Test-CIPPAccess {
     # Initialize per-call profiling
     $AccessTimings = @{}
     $AccessTotalSw = [System.Diagnostics.Stopwatch]::StartNew()
-    if ($Request.Params.CIPPEndpoint -eq 'ExecSAMSetup') { return $true }
 
     # Get function help
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
 
     $SwPermissions = [System.Diagnostics.Stopwatch]::StartNew()
-    if (-not $global:CIPPFunctionPermissions) {
-        $CIPPCoreModule = Get-Module -Name CIPPCore
-        if ($CIPPCoreModule) {
-            $PermissionsFileJson = Join-Path $CIPPCoreModule.ModuleBase 'lib' 'data' 'function-permissions.json'
+    if (-not $script:CIPPFunctionPermissions) {
+        if ($global:CIPPFunctionPermissions) {
+            $script:CIPPFunctionPermissions = $global:CIPPFunctionPermissions
+        } else {
+            $PermissionsFileJson = Join-Path $env:CIPPRootPath 'Config\function-permissions.json'
 
             if (Test-Path $PermissionsFileJson) {
                 try {
-                    $jsonData = Get-Content -Path $PermissionsFileJson -Raw | ConvertFrom-Json -AsHashtable
-                    $global:CIPPFunctionPermissions = [System.Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
-                    foreach ($key in $jsonData.Keys) {
-                        $global:CIPPFunctionPermissions[$key] = $jsonData[$key]
-                    }
-                    Write-Debug "Loaded $($global:CIPPFunctionPermissions.Count) function permissions from JSON cache"
+                    $script:CIPPFunctionPermissions = [System.IO.File]::ReadAllText($PermissionsFileJson) | ConvertFrom-Json -AsHashtable
+                    Write-Debug "Loaded $($script:CIPPFunctionPermissions.Count) function permissions from JSON cache"
                 } catch {
                     Write-Warning "Failed to load function permissions from JSON: $($_.Exception.Message)"
                 }
@@ -37,8 +33,8 @@ function Test-CIPPAccess {
 
     if ($FunctionName -ne 'Invoke-me') {
         $swHelp = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($global:CIPPFunctionPermissions -and $global:CIPPFunctionPermissions.ContainsKey($FunctionName)) {
-            $PermissionData = $global:CIPPFunctionPermissions[$FunctionName]
+        if ($script:CIPPFunctionPermissions -and $script:CIPPFunctionPermissions.ContainsKey($FunctionName)) {
+            $PermissionData = $script:CIPPFunctionPermissions[$FunctionName]
             $APIRole = $PermissionData['Role']
             $Functionality = $PermissionData['Functionality']
             Write-Debug "Loaded function permission data from cache for '$FunctionName': Role='$APIRole', Functionality='$Functionality'"
@@ -56,11 +52,11 @@ function Test-CIPPAccess {
         $AccessTimings['GetHelp'] = $swHelp.Elapsed.TotalMilliseconds
     }
 
-    # Get default roles from config
+    # Get default roles from config (cache per runspace for performance)
     $swRolesLoad = [System.Diagnostics.Stopwatch]::StartNew()
-    $CIPPCoreModuleRoot = Get-Module -Name CIPPCore | Select-Object -ExpandProperty ModuleBase
-    $CIPPRoot = (Get-Item $CIPPCoreModuleRoot).Parent.Parent
-    $BaseRoles = Get-Content -Path $CIPPRoot\Config\cipp-roles.json | ConvertFrom-Json
+    if (-not $script:CIPPBaseRoles) {
+        $script:CIPPBaseRoles = [System.IO.File]::ReadAllText((Join-Path $env:CIPPRootPath 'Config\cipp-roles.json')) | ConvertFrom-Json
+    }
     $swRolesLoad.Stop()
     $AccessTimings['LoadBaseRoles'] = $swRolesLoad.Elapsed.TotalMilliseconds
     $DefaultRoles = @('superadmin', 'admin', 'editor', 'readonly', 'anonymous', 'authenticated')
@@ -100,7 +96,7 @@ function Test-CIPPAccess {
                         }
                     }
                     $BaseRole = $null
-                    foreach ($Role in $BaseRoles.PSObject.Properties) {
+                    foreach ($Role in $script:CIPPBaseRoles.PSObject.Properties) {
                         foreach ($ClientRole in $Client.Role) {
                             if ($Role.Name -eq $ClientRole) {
                                 $BaseRole = $Role
@@ -148,8 +144,35 @@ function Test-CIPPAccess {
             $AccessTimings['ResolveUserRoles'] = $swResolveUserRoles.Elapsed.TotalMilliseconds
         }
 
-        #Write-Information ($User | ConvertTo-Json -Depth 5)
-        # Return user permissions
+        $swIPCheck = [System.Diagnostics.Stopwatch]::StartNew()
+        $AllowedIPRanges = Get-CIPPRoleIPRanges -Roles $User.userRoles
+
+        if ($AllowedIPRanges -notcontains 'Any') {
+            $ForwardedFor = $Request.Headers.'x-forwarded-for' -split ',' | Select-Object -First 1
+            $IPRegex = '^(?<IP>(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+))(?::\d+)?$'
+            $IPAddress = $ForwardedFor -replace $IPRegex, '$1' -replace '[\[\]]', ''
+            if ($IPAddress) {
+                $IPAllowed = $false
+                foreach ($Range in $AllowedIPRanges) {
+                    if ($IPAddress -eq $Range -or (Test-IpInRange -IPAddress $IPAddress -Range $Range)) {
+                        $IPAllowed = $true
+                        break
+                    }
+                }
+
+                if (-not $IPAllowed -and -not $Request.Params.CIPPEndpoint -eq 'me') {
+                    throw "Access to this CIPP API endpoint is not allowed, your IP address ($IPAddress) is not in the allowed range for your role(s)"
+                }
+            } else {
+                $IPAllowed = $true
+            }
+        } else {
+            $IPAllowed = $true
+        }
+
+        $swIPCheck.Stop()
+        $AccessTimings['IPRangeCheck'] = $swIPCheck.Elapsed.TotalMilliseconds
+
         if ($Request.Params.CIPPEndpoint -eq 'me') {
 
             if (!$User.userRoles) {
@@ -159,6 +182,18 @@ function Test-CIPPAccess {
                             @{
                                 'clientPrincipal' = $null
                                 'permissions'     = @()
+                            } | ConvertTo-Json -Depth 5)
+                    })
+            }
+
+            if (!$IPAllowed) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::OK
+                        Body       = (
+                            @{
+                                'clientPrincipal' = $null
+                                'permissions'     = @()
+                                'message'         = "Your IP address ($IPAddress) is not in the allowed range for your role(s)"
                             } | ConvertTo-Json -Depth 5)
                     })
             }
@@ -196,7 +231,7 @@ function Test-CIPPAccess {
         } elseif ($User.userRoles -contains 'admin') {
             $User.userRoles = @('admin')
         }
-        foreach ($Role in $BaseRoles.PSObject.Properties) {
+        foreach ($Role in $script:CIPPBaseRoles.PSObject.Properties) {
             foreach ($UserRole in $User.userRoles) {
                 if ($Role.Name -eq $UserRole) {
                     $BaseRole = $Role
